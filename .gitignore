@@ -19,3 +19,6 @@ venv/
 
 # 诊断临时文件
 proxy_cert.*
+
+# 本地 SSH 密钥（绝不提交）
+.ssh-upload/

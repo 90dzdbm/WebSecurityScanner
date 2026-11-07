@@ -1,0 +1,21 @@
+# Python 运行产物
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物（PyInstaller）
+build/
+dist/
+buildtools/
+*.spec
+
+# 临时截图与日志
+*.png
+*.log
+
+# 本地环境
+.venv/
+venv/
+
+# 诊断临时文件
+proxy_cert.*

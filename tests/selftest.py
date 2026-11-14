@@ -316,6 +316,36 @@ def test_continuous_scan(port):
           "线程上限已放宽（不再限制为 5）：THREADS_LIMIT=%s" % THREADS_LIMIT)
 
 
+def test_aggressive_mode(port):
+    """有害化攻击模式：报告标注、激进探针生效、仍能发现 SQL 注入。"""
+    from websectool.config import AGGRESSIVE_PAYLOADS, CUSTOM_INTENSITY
+
+    target = "http://127.0.0.1:%s/" % port
+    custom = {
+        "delay": 0.0, "threads": 2, "timeout": 2.0, "retries": 0,
+        "max_forms": 2, "max_fields_per_form": 2,
+        "ports": [port], "paths": ["/robots.txt"],
+    }
+    messages = queue.Queue()
+    report, stopped = run_scan(
+        target, CUSTOM_INTENSITY, messages, threading.Event(),
+        level_config=custom, aggressive=True,
+    )
+    logs = []
+    while not messages.empty():
+        message = messages.get_nowait()
+        if message[0] == "log":
+            logs.append(message[2])
+
+    check(not stopped, "有害化攻击模式扫描正常结束")
+    check("检测模式   ：有害化攻击模式" in report, "报告标注有害化攻击模式")
+    check(any("时间盲注" in line for line in logs), "日志说明激进探针内容")
+    check("疑似 SQL 注入" in report, "激进探针仍能发现 SQL 注入迹象")
+    check(len(AGGRESSIVE_PAYLOADS["sqli_time"]) >= 2
+          and len(AGGRESSIVE_PAYLOADS["cmdi"]) >= 2,
+          "激进探针集合已定义（时间盲注 / 命令注入）")
+
+
 def test_gui():
     try:
         import tkinter as tk
@@ -352,6 +382,8 @@ def test_gui():
         check(custom_enabled, "选择自定义档位后“自定义参数”按钮启用")
         check(continuous_enabled, "持续扫描开关在就绪状态下可用")
         check(not continuous_default, "持续扫描开关默认为关闭")
+        check(hasattr(app, "aggressive_check"), "主窗口包含有害化攻击模式开关")
+        check(not app.aggressive_var.get(), "有害化攻击模式默认为关闭")
         check(ultra_exists, "主窗口包含超强力扫描控制行")
         check(not child_exists, "子窗口不再显示超强力扫描行（防止无限派生）")
         check(custom_hint.startswith("自定义参数："),
@@ -370,6 +402,7 @@ def main():
         test_scan(port)
         test_custom_scan(port)
         test_ultra_payload()
+        test_aggressive_mode(port)
         test_continuous_scan(port)
         test_stop(port)
         test_gui()

@@ -13,5 +13,5 @@ Web 安全测试工具的内部包。
 本包只依赖 Python 标准库，便于使用 PyInstaller 打包为单个可执行文件。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["config", "scanner", "gui"]

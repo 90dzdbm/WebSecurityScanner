@@ -218,7 +218,7 @@ DEFAULT_CUSTOM_CONFIG = {
 # 请求使用的 User-Agent（明确标识为安全测试工具）
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "WebSecurityScanner/1.0 (authorized-security-test)"
+    "WebSecurityScanner/1.1 (authorized-security-test)"
 )
 
 # 表单检测使用的无害 payload：
@@ -228,6 +228,47 @@ PAYLOADS = {
     "sqli": "'",
     "xss": "<script>alert(1)</script>",
 }
+
+# ---------------------------------------------------------------------------
+# 有害化攻击模式（激进检测）使用的探针
+# ---------------------------------------------------------------------------
+# 相比默认的无害 payload，这里追加更“像攻击”的探测：
+#   sqli_error —— 更多 SQL 报错/布尔变体
+#   sqli_time  —— 时间盲注探针，只等待 3 秒，用于判断响应是否被延迟
+#   xss        —— 更多 XSS 变体（仍然只判断反射，不执行脚本）
+#   cmdi       —— 命令注入回显探针，只让服务器 echo 一个固定标记，
+#                 不读取文件、不写文件、不反弹 shell
+# 所有探针依然是非破坏性的：不删除/篡改数据、不做暴力破解、不发大规模洪泛。
+AGGRESSIVE_PAYLOADS = {
+    "sqli_error": (
+        "'",
+        "\"",
+        "')",
+        "\";",
+        "1' AND '1'='1",
+        "1' AND '1'='2",
+    ),
+    "sqli_time": (
+        "1' AND SLEEP(3)-- ",
+        "1; WAITFOR DELAY '0:0:3'--",
+        "1' AND pg_sleep(3)-- ",
+    ),
+    "xss": (
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        "\"><svg/onload=alert(1)>",
+    ),
+    "cmdi": (
+        ";echo WST_CMD_OK",
+        "|echo WST_CMD_OK",
+        "$(echo WST_CMD_OK)",
+    ),
+}
+
+# 时间盲注探针的预期延迟（秒）与判定阈值；命令注入回显的固定标记
+AGGRESSIVE_TIME_SLEEP = 3.0
+AGGRESSIVE_TIME_THRESHOLD = 2.4
+AGGRESSIVE_MARKER = "WST_CMD_OK"
 
 # 不作为漏洞测试目标的表单字段类型（提交按钮、文件上传等）
 SKIP_INPUT_TYPES = {

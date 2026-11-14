@@ -660,6 +660,7 @@ class ScannerApp(tk.Tk):
         if payload.get("config"):
             self.custom_config = dict(payload["config"])
         self.continuous_var.set(bool(payload.get("continuous")))
+        self.aggressive_var.set(bool(payload.get("aggressive")))
         self._update_level_hint()
 
     def _auto_start_as_child(self):
@@ -671,6 +672,7 @@ class ScannerApp(tk.Tk):
         level = payload.get("level", DEFAULT_INTENSITY)
         level_config = payload.get("config")
         continuous = bool(payload.get("continuous"))
+        aggressive = bool(payload.get("aggressive"))
         if not target:
             return
 
@@ -696,10 +698,15 @@ class ScannerApp(tk.Tk):
                         "本窗口由超强力扫描自动打开，参数与授权继承自主窗口。")
         if continuous:
             self.append_log("系统", "持续扫描已开启：将持续循环，直到点击“停止扫描”。")
+        if aggressive:
+            self.append_log(
+                "警告",
+                "有害化攻击模式已开启：将追加时间盲注、命令注入回显等激进探针。",
+            )
 
         self.worker = threading.Thread(
             target=self._scan_worker,
-            args=(target, level, level_config, continuous),
+            args=(target, level, level_config, continuous, aggressive),
             name="scan-worker",
             daemon=True,
         )
@@ -707,6 +714,20 @@ class ScannerApp(tk.Tk):
 
         self._tick_timer()
         self.after(80, self._poll_messages)
+        # 子窗口生效（开始扫描）后自动最小化，避免遮挡主窗口
+        self.after(700, self._hide_after_start)
+
+    def _hide_after_start(self):
+        """子窗口开始扫描后自动最小化到任务栏，防止遮挡父窗口。"""
+        if not self.scanning:
+            return
+        try:
+            self.iconify()
+        except tk.TclError:
+            return
+        self.append_log(
+            "信息", "子窗口已自动最小化，避免遮挡主窗口；可从任务栏恢复查看。"
+        )
 
     # ------------------------------------------------------------------
     # 样式
@@ -878,6 +899,20 @@ class ScannerApp(tk.Tk):
             variable=self.continuous_var,
         )
         self.continuous_check.pack(side="left")
+
+        # 有害化攻击模式：追加时间盲注、命令注入回显等激进探针。
+        # 子窗口同样可以使用（它不是派生窗口的开关，不受 ultra 行限制）。
+        aggressive_row = ttk.Frame(parent)
+        aggressive_row.pack(fill="x", pady=(0, 10))
+
+        self.aggressive_var = tk.BooleanVar(value=False)
+        self.aggressive_check = ttk.Checkbutton(
+            aggressive_row,
+            text="有害化攻击模式（时间盲注 / 命令注入回显等激进探针）",
+            variable=self.aggressive_var,
+            command=self._on_aggressive_toggle,
+        )
+        self.aggressive_check.pack(side="left")
 
         # 超强力扫描行：勾选后开始扫描时按指定数量打开相同参数的
         # 扫描器子窗口并自动开扫；数量无上限，可一键打开 / 一键关闭。
@@ -1055,15 +1090,37 @@ class ScannerApp(tk.Tk):
             )
 
     # ------------------------------------------------------------------
+    # 有害化攻击模式
+    # ------------------------------------------------------------------
+    def _on_aggressive_toggle(self):
+        """勾选有害化攻击模式时二次确认；取消勾选直接生效。"""
+        if not self.aggressive_var.get():
+            return
+        confirmed = messagebox.askyesno(
+            "有害化攻击模式",
+            "该模式会在扫描中追加更具攻击性的探针：\n"
+            "  · 时间盲注（SLEEP / WAITFOR，单次约 3 秒）\n"
+            "  · 命令注入回显（只执行 echo 固定标记，不读取数据）\n"
+            "  · 扩展的 SQLi / XSS 变体\n\n"
+            "探针保持非破坏性，但可能触发目标 WAF/IDS 告警。\n"
+            "请确认目标为您拥有授权的测试环境。是否开启？",
+            parent=self,
+        )
+        if not confirmed:
+            self.aggressive_var.set(False)
+
+    # ------------------------------------------------------------------
     # 超强力扫描：批量打开 / 关闭相同参数的子扫描窗口
     # ------------------------------------------------------------------
-    def _build_child_payload(self, target, level, level_config, continuous):
+    def _build_child_payload(self, target, level, level_config, continuous,
+                             aggressive=False):
         """组装传给子窗口进程的参数字典（与原窗口完全一致）。"""
         return {
             "target": target,
             "level": level,
             "config": dict(level_config) if level_config else None,
             "continuous": bool(continuous),
+            "aggressive": bool(aggressive),
         }
 
     def _parse_ultra_count(self):
@@ -1174,7 +1231,8 @@ class ScannerApp(tk.Tk):
         self.url_var.set(target)
         self.url_entry.configure(foreground=COLOR_TEXT)
         self._active_payload = self._build_child_payload(
-            target, level, level_config, self.continuous_var.get()
+            target, level, level_config, self.continuous_var.get(),
+            bool(self.aggressive_var.get()),
         )
         self._spawn_child_windows(count)
 
@@ -1251,6 +1309,7 @@ class ScannerApp(tk.Tk):
             self.status_var.set("扫描中…")
             # 扫描过程中不允许改变扫描模式
             self.continuous_check.state(["disabled"])
+            self.aggressive_check.state(["disabled"])
             if self.child_payload is None:
                 # 超强力扫描开关同样锁定，但“一键打开/关闭”扫描中仍可用
                 self.ultra_check.state(["disabled"])
@@ -1259,6 +1318,7 @@ class ScannerApp(tk.Tk):
             self.stop_button.state(["disabled"])
             self.status_var.set("就绪")
             self.continuous_check.state(["!disabled"])
+            self.aggressive_check.state(["!disabled"])
             if self.child_payload is None:
                 self.ultra_check.state(["!disabled"])
         self._update_custom_button()
@@ -1297,6 +1357,8 @@ class ScannerApp(tk.Tk):
             else INTENSITY_LEVELS[level]
         # 是否开启“持续扫描”：勾选后由后台线程循环执行，直到用户停止
         continuous = bool(self.continuous_var.get())
+        # 是否开启“有害化攻击模式”：追加时间盲注/命令注入回显等激进探针
+        aggressive = bool(self.aggressive_var.get())
         # 是否开启“超强力扫描”：子窗口数量无上限
         ultra = bool(self.ultra_var.get()) if self.child_payload is None \
             else False
@@ -1324,7 +1386,7 @@ class ScannerApp(tk.Tk):
 
         # 记录本次确认过的参数，供“一键打开”和子窗口继承使用
         self._active_payload = self._build_child_payload(
-            target, level, level_config, continuous
+            target, level, level_config, continuous, aggressive
         )
 
         # 重置运行状态
@@ -1343,6 +1405,11 @@ class ScannerApp(tk.Tk):
         self.append_log("信息", "本次参数：%s。" % describe_config(active_config))
         if continuous:
             self.append_log("系统", "持续扫描已开启：将持续循环，直到点击“停止扫描”。")
+        if aggressive:
+            self.append_log(
+                "警告",
+                "有害化攻击模式已开启：将追加时间盲注、命令注入回显等激进探针。",
+            )
         if ultra:
             self.append_log(
                 "系统",
@@ -1352,7 +1419,7 @@ class ScannerApp(tk.Tk):
 
         self.worker = threading.Thread(
             target=self._scan_worker,
-            args=(target, level, level_config, continuous),
+            args=(target, level, level_config, continuous, aggressive),
             name="scan-worker",
             daemon=True,
         )
@@ -1365,17 +1432,20 @@ class ScannerApp(tk.Tk):
         self._tick_timer()
         self.after(80, self._poll_messages)
 
-    def _scan_worker(self, target, level, level_config, continuous=False):
+    def _scan_worker(self, target, level, level_config, continuous=False,
+                     aggressive=False):
         """后台线程：执行扫描，只通过消息队列与界面通信。
 
         continuous=True 时进入持续扫描模式：每轮结束后自动开始下一轮，
         直到用户点击“停止扫描”（设置 stop_event）才退出。
+        aggressive=True 时启用有害化攻击模式（激进探针）。
         """
         try:
             report, stopped = run_scan(
                 target, level, self.message_queue, self.stop_event,
                 level_config=level_config,
                 continuous=continuous,
+                aggressive=aggressive,
             )
             self.message_queue.put(("done", report, stopped))
         except Exception:
@@ -1436,6 +1506,13 @@ class ScannerApp(tk.Tk):
             self.progress.configure(value=100)
 
         self.worker = None
+        # 子窗口在扫描期间会被自动最小化，结束时恢复显示以便查看报告
+        if self.child_payload is not None:
+            try:
+                if self.state() == "iconic":
+                    self.deiconify()
+            except tk.TclError:
+                pass
         self._show_report(report_text, stopped)
 
     def _handle_worker_error(self, detail):

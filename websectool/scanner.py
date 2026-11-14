@@ -33,6 +33,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from .config import (
+    AGGRESSIVE_MARKER,
+    AGGRESSIVE_PAYLOADS,
+    AGGRESSIVE_TIME_SLEEP,
+    AGGRESSIVE_TIME_THRESHOLD,
     INTENSITY_LEVELS,
     PAYLOADS,
     SENSITIVE_PATH_KEYWORDS,
@@ -510,7 +514,8 @@ def _new_result(target, level_name):
     }
 
 
-def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
+def _run_round(target, level_name, cfg, q, stop_event, round_index=0,
+               aggressive=False):
     """
     执行一轮完整的五阶段扫描，并生成这一轮的文本报告。
 
@@ -521,12 +526,15 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
         q             与界面通信的 queue.Queue
         stop_event    threading.Event，用于安全停止
         round_index   持续扫描时的轮次序号（从 1 开始）；0 表示单轮扫描
+        aggressive    True 时启用“有害化攻击模式”：追加时间盲注、
+                      命令注入回显等更具攻击性的探针（仍为非破坏性）
 
     返回：
         (report_text, stopped, result)
     """
     result = _new_result(target, level_name)
     result["config"] = dict(cfg)
+    result["aggressive"] = bool(aggressive)
     result["round"] = round_index
     scan_started = time.monotonic()
 
@@ -559,6 +567,10 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
 
     stopped = False
     try:
+        if aggressive:
+            log("警告",
+                "有害化攻击模式已开启：将追加时间盲注、命令注入回显等激进探针"
+                "（探针保持非破坏性，但可能触发目标 WAF/IDS 告警）。")
         # ================================================================
         # 1. 信息收集
         # ================================================================
@@ -858,29 +870,47 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
                             defaults[name] = field.get("value", "")
 
                     baseline = None
+                    baseline_elapsed = 0.0
+                    baseline_started = time.monotonic()
                     try:
                         baseline = submit_form(
                             action_url, method, defaults, cfg, opener, stop_event
                         )
+                        baseline_elapsed = time.monotonic() - baseline_started
                     except RequestFailed as exc:
                         log("警告", "表单基线请求失败：%s" % _short(exc, 120))
 
                     issues = []
                     tested_requests = 0
 
+                    # 有害化攻击模式：追加更多 SQL 变体、时间盲注与命令注入回显探针
+                    if aggressive:
+                        probes = []
+                        for _name in ("sqli_error", "xss", "cmdi"):
+                            for _payload in AGGRESSIVE_PAYLOADS[_name]:
+                                probes.append((_name, _payload))
+                        for _payload in AGGRESSIVE_PAYLOADS["sqli_time"]:
+                            probes.append(("sqli_time", _payload))
+                    else:
+                        probes = list(PAYLOADS.items())
+
                     for field in fields[:max_fields]:
                         field_name = field["name"]
-                        for payload_name, payload in PAYLOADS.items():
+                        for payload_name, payload in probes:
                             if stop_event.is_set():
                                 raise ScanStopped()
                             pause()
 
                             data = dict(defaults)
                             data[field_name] = payload
+                            request_started = time.monotonic()
                             try:
                                 response = submit_form(
                                     action_url, method, data,
                                     cfg, opener, stop_event
+                                )
+                                request_elapsed = (
+                                    time.monotonic() - request_started
                                 )
                             except RequestFailed as exc:
                                 log("警告", "字段 %s 测试请求失败：%s"
@@ -907,14 +937,56 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
                                         "疑似反射型 XSS",
                                         "%s 字段 %s" % (action_url, field_name),
                                     )
+                            elif payload_name == "cmdi":
+                                # 命令注入回显：只让服务器 echo 固定标记，
+                                # 命中说明输入可能被拼接进了系统命令。
+                                # 先剔除“整段 payload 被原样反射”的情况，
+                                # 避免把单纯的反射误判为命令执行。
+                                stripped_body = response.body.replace(payload, "")
+                                if (AGGRESSIVE_MARKER in stripped_body
+                                        and AGGRESSIVE_MARKER not in baseline_body):
+                                    message = (
+                                        "字段 %s 的输入疑似被拼接进系统命令，"
+                                        "命令回显标记出现在响应中（HTTP %s）"
+                                        % (field_name, response.status)
+                                    )
+                                    log("风险", "表单 %s：%s"
+                                        % (action_url, message))
+                                    issues.append(("高", message))
+                                    add_finding(
+                                        "高",
+                                        "疑似命令注入",
+                                        "%s 字段 %s" % (action_url, field_name),
+                                    )
+                            elif payload_name == "sqli_time":
+                                # 时间盲注：响应被延迟到接近 SLEEP 时长，
+                                # 且基线请求明显更快时判定为可疑
+                                if (request_elapsed >= AGGRESSIVE_TIME_THRESHOLD
+                                        and request_elapsed
+                                        > baseline_elapsed + 2.0):
+                                    message = (
+                                        "字段 %s 的时间盲注探针使响应延迟 "
+                                        "%.1f 秒（基线 %.1f 秒）"
+                                        % (field_name, request_elapsed,
+                                           baseline_elapsed)
+                                    )
+                                    log("风险", "表单 %s：%s"
+                                        % (action_url, message))
+                                    issues.append(("高", message))
+                                    add_finding(
+                                        "高",
+                                        "疑似时间盲注",
+                                        "%s 字段 %s" % (action_url, field_name),
+                                    )
                             else:
                                 signature = find_sql_error(
                                     response.body, baseline_body
                                 )
                                 if signature:
                                     message = (
-                                        "字段 %s 的单引号输入触发数据库错误特征"
-                                        "（%s）" % (field_name, signature)
+                                        "字段 %s 的 SQL 注入探针触发数据库"
+                                        "错误特征（%s）"
+                                        % (field_name, signature)
                                     )
                                     log("风险", "表单 %s：%s"
                                         % (action_url, message))
@@ -928,7 +1000,7 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
                                       and response.status >= 500
                                       and baseline.status < 500):
                                     message = (
-                                        "字段 %s 的单引号输入导致服务器返回"
+                                        "字段 %s 的注入探针导致服务器返回"
                                         " HTTP %s" % (field_name, response.status)
                                     )
                                     log("警告", "表单 %s：%s"
@@ -981,7 +1053,7 @@ def _run_round(target, level_name, cfg, q, stop_event, round_index=0):
 
 
 def run_scan(target, level_name, q, stop_event, level_config=None,
-             continuous=False):
+             continuous=False, aggressive=False):
     """
     扫描主流程（对外入口）。
 
@@ -1009,7 +1081,7 @@ def run_scan(target, level_name, q, stop_event, level_config=None,
     # ---------------- 单轮扫描 ----------------
     if not continuous:
         report, stopped, _result = _run_round(
-            target, level_name, cfg, q, stop_event
+            target, level_name, cfg, q, stop_event, aggressive=aggressive
         )
         return report, stopped
 
@@ -1026,7 +1098,8 @@ def run_scan(target, level_name, q, stop_event, level_config=None,
     while not stop_event.is_set():
         rounds += 1
         report, round_stopped, result = _run_round(
-            target, level_name, cfg, q, stop_event, round_index=rounds
+            target, level_name, cfg, q, stop_event, round_index=rounds,
+            aggressive=aggressive,
         )
         reports.append(report)
         results.append(result)
@@ -1050,7 +1123,7 @@ def run_scan(target, level_name, q, stop_event, level_config=None,
     ended = datetime.now()
     report = _build_continuous_report(
         target, level_name, cfg, results, reports,
-        started, ended, stopped, rounds,
+        started, ended, stopped, rounds, aggressive=aggressive,
     )
     q.put(("progress", 100))
     q.put(("stage", "已停止" if stopped else "完成"))
@@ -1064,7 +1137,8 @@ def run_scan(target, level_name, q, stop_event, level_config=None,
 
 
 def _build_continuous_report(target, level_name, cfg, results, reports,
-                             started, ended, stopped, rounds):
+                             started, ended, stopped, rounds,
+                             aggressive=False):
     """持续扫描模式：把各轮报告与总体统计汇总为一份文本报告。"""
     duration = int((ended - started).total_seconds())
 
@@ -1084,6 +1158,9 @@ def _build_continuous_report(target, level_name, cfg, results, reports,
     add("目标 URL   ：%s" % target)
     add("扫描强度   ：%s" % level_name)
     add("扫描模式   ：持续扫描（循环执行，直到用户主动停止）")
+    if aggressive:
+        add("检测模式   ：有害化攻击模式（激进探针：时间盲注 / 命令注入回显 / "
+            "扩展 SQLi、XSS）")
     add("参数       ：请求间隔 %ss，并发 %s，超时 %ss，重试 %s 次，"
         "字典 %s 条，端口 %s 个"
         % (cfg.get("delay"), cfg.get("threads"), cfg.get("timeout"),
@@ -1136,6 +1213,9 @@ def build_report(result):
     add("=" * 64)
     add("目标 URL   ：%s" % result.get("target", ""))
     add("扫描强度   ：%s" % level)
+    if result.get("aggressive"):
+        add("检测模式   ：有害化攻击模式（激进探针：时间盲注 / 命令注入回显 / "
+            "扩展 SQLi、XSS）")
     if result.get("round"):
         # 持续扫描模式下标注当前是第几轮
         add("轮次       ：第 %s 轮（持续扫描）" % result["round"])

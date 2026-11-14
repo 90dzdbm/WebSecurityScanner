@@ -6,8 +6,13 @@ __pycache__/
 # 打包产物（PyInstaller）
 build/
 dist/
+dist_dir/
 buildtools/
 *.spec
+
+# 发行包（二进制不进仓库）
+*.zip
+*.sha256
 
 # 临时截图与日志
 *.png
